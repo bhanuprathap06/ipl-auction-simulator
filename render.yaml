@@ -1,0 +1,50 @@
+## ─────────────────────────────────────────────────────────────────
+##  render.yaml  –  IPL 2026 Auction Simulator
+##
+##  This file lets Render auto-detect and configure both services.
+##  After connecting your GitHub repo on render.com, select
+##  "Blueprint" and Render will read this file automatically.
+##
+##  ⚠️  You MUST still set the secret env vars manually in the
+##  Render dashboard (MONGODB_URI, CLIENT_URL, VITE_SERVER_URL)
+##  after the first deploy — they contain credentials.
+## ─────────────────────────────────────────────────────────────────
+
+services:
+
+  ## ── 1. BACKEND – Node.js Web Service ──────────────────────────
+  - type: web
+    name: ipl-auction-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node src/app.js
+    healthCheckPath: /api/health
+    plan: free                # upgrade to starter for always-on
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000           # Render will override with its own port
+      ## ⚠️  Set these in the Render dashboard → Environment tab:
+      - key: MONGODB_URI
+        sync: false           # marks as "secret — set manually"
+      - key: CLIENT_URL
+        sync: false           # the Render static site URL (step 4 below)
+
+  ## ── 2. FRONTEND – Vite Static Site ────────────────────────────
+  - type: web
+    name: ipl-auction-client
+    runtime: static
+    rootDir: client
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    # SPA fallback — all routes → index.html
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      ## ⚠️  Set this in the Render dashboard → Environment tab:
+      - key: VITE_SERVER_URL
+        sync: false           # the Render web service URL (step 3 below)
