@@ -9,24 +9,6 @@ const Player = require('../models/Player');
 // In-memory room store: roomCode → roomState
 const rooms = new Map();
 
-/* ─── ROOM STATE SCHEMA ───────────────────────────────────────────
- * {
- *   code, hostSocketId, hostUserId, status,
- *   participants: [{ socketId, userId, username, teamId, teamName,
- *                    primaryColor, budget, spent, squad, isHost, isConnected }],
- *   playerPool: [ ...Player docs ],  // shuffled
- *   currentIndex: 0,
- *   currentPlayer: Player | null,
- *   currentBid: { amount, teamId, teamName, username } | null,
- *   timerSeconds: 30,
- *   timerInterval: null,
- *   timeLeft: 30,
- *   bidLog: [],
- *   config: { totalBudget, timerSeconds, minBidIncrement },
- *   lastBidAt: Map<teamId, timestamp>  // anti-spam
- * }
- */
-
 const IPL_TEAM_COLORS = {
   MI:   { primary: '#004BA0', secondary: '#D1AB3E' },
   CSK:  { primary: '#F9CD05', secondary: '#0081E9' },
@@ -52,12 +34,16 @@ function shuffleArray(arr) {
 
 function generateAIPlayer(index) {
   const roles = ['Batsman', 'Bowler', 'All-Rounder', 'Wicket-Keeper'];
-  const names = ['Raj Kumar', 'Amit Singh', 'Pradeep Rao', 'Sanjay Mishra', 'Kiran Verma', 'Dev Chauhan', 'Anil Jha', 'Ravi Nair'];
+  const names = [
+    'Raj Kumar', 'Amit Singh', 'Pradeep Rao', 'Sanjay Mishra',
+    'Kiran Verma', 'Dev Chauhan', 'Anil Jha', 'Ravi Nair',
+    'Suresh Patel', 'Vikram Das',
+  ];
   const nationalities = ['Indian', 'Indian', 'Indian', 'West Indian', 'Sri Lankan'];
   const role = roles[index % roles.length];
   return {
     _id: `ai_${Date.now()}_${index}`,
-    name: names[index % names.length] + ` ${Math.floor(Math.random() * 99) + 1}`,
+    name: `${names[index % names.length]} ${Math.floor(Math.random() * 99) + 1}`,
     role,
     nationality: nationalities[index % nationalities.length],
     isOverseas: index % 5 === 0,
@@ -90,16 +76,16 @@ function createRoom(code, { socketId, userId, username, teamId, teamName }, conf
     }],
     playerPool: [],
     currentIndex: 0,
-    currentPlayer: null,
     currentBid: null,
     timerSeconds: config.timerSeconds || 30,
     timerInterval: null,
     timeLeft: 0,
     bidLog: [],
     config: {
-      totalBudget: config.totalBudget || 12000,  // Lakhs
+      totalBudget: config.totalBudget || 12000,
       timerSeconds: config.timerSeconds || 30,
-      minBidIncrement: config.minBidIncrement || 25, // Lakhs
+      minBidIncrement: config.minBidIncrement || 25,
+      bidBonusSeconds: config.bidBonusSeconds || 15, // time added per bid, capped at timerSeconds
     },
     lastBidAt: new Map(),
     soldCount: 0,
@@ -122,9 +108,9 @@ function deleteRoom(code) {
 function joinRoom(code, { socketId, userId, username, teamId, teamName }) {
   const room = rooms.get(code);
   if (!room) return { error: 'Room not found' };
-  if (room.status !== 'waiting') return { error: 'Auction already in progress' };
+  if (room.status !== 'waiting') return { error: 'Auction already in progress. You can rejoin if you were already in this room.' };
 
-  // check team not already taken (unless rejoining)
+  // Check if same userId already exists → treat as rejoin
   const existing = room.participants.find(p => p.userId === userId);
   if (existing) {
     existing.socketId = socketId;
@@ -155,7 +141,10 @@ function rejoinRoom(code, { socketId, userId }) {
   const room = rooms.get(code);
   if (!room) return null;
   const p = room.participants.find(p => p.userId === userId);
-  if (p) { p.socketId = socketId; p.isConnected = true; }
+  if (p) {
+    p.socketId = socketId;
+    p.isConnected = true;
+  }
   return room;
 }
 
@@ -172,11 +161,19 @@ async function startAuction(code) {
   if (!room) return { error: 'Room not found' };
   if (room.participants.length < 2) return { error: 'Need at least 2 teams to start' };
 
-  // load & shuffle player pool
-  const players = await Player.find({ status: 'available' }).lean();
+  // FIX #3: Fetch ALL players (ignore DB sold/unsold status) so every new
+  // auction gets a full fresh pool regardless of previous sessions.
+  const players = await Player.find({}).lean();
+  if (!players.length) return { error: 'No players found in database. Please run the seed script.' };
+
   room.playerPool = shuffleArray(players);
   room.currentIndex = 0;
+  room.currentBid = null;
+  room.bidLog = [];
+  room.soldCount = 0;
+  room.unsoldCount = 0;
   room.status = 'active';
+  room.timeLeft = room.timerSeconds;
 
   return { room, currentPlayer: room.playerPool[0] };
 }
@@ -214,15 +211,18 @@ function placeBid(code, { socketId, userId, teamId, teamName, username, amount }
   const remaining = participant.budget - participant.spent;
   if (amount > remaining) return { error: `Insufficient budget. You have ₹${remaining}L remaining` };
 
-  // Cannot bid on same player twice in a row
+  // Cannot outbid yourself
   if (room.currentBid?.teamId === teamId) return { error: 'You already have the highest bid!' };
 
   // Accept bid
   room.currentBid = { amount, teamId, teamName, username, timestamp: Date.now() };
   room.lastBidAt.set(teamId, Date.now());
 
-  // Reset timer to 15s after each bid
-  room.timeLeft = Math.min(room.timeLeft, 15);
+  // Smart bid-bonus timer: add bonus seconds per bid, capped at the room default.
+  // e.g. 5s left + 15s bonus = 20s (creates real tension near zero)
+  // e.g. 20s left + 15s bonus = 30s (capped — never exceeds default)
+  const bonus = room.config.bidBonusSeconds || 15;
+  room.timeLeft = Math.min(room.timeLeft + bonus, room.timerSeconds);
 
   const entry = {
     playerId: currentPlayer._id?.toString(),
@@ -247,7 +247,6 @@ function soldPlayer(code) {
   const result = { player, bid, status: bid ? 'sold' : 'unsold' };
 
   if (bid) {
-    // Update participant squad
     const participant = room.participants.find(p => p.teamId === bid.teamId);
     if (participant) {
       participant.spent += bid.amount;
@@ -282,24 +281,27 @@ function advanceToNextPlayer(code) {
     room.playerPool.push(aiPlayer);
   }
 
-  const next = room.playerPool[room.currentIndex];
-  return next;
+  return room.playerPool[room.currentIndex];
 }
 
+// FIX #2: Auction ends when ALL original (non-AI) players have been presented once.
 function isAuctionComplete(code) {
   const room = rooms.get(code);
   if (!room) return true;
-  // Auction ends when all human-controlled teams have less budget than min bid increment
-  // or we've done 2x the initial pool size
-  const initialPoolSize = room.playerPool.filter(p => !p.isAIGenerated).length;
-  if (room.currentIndex >= initialPoolSize * 2) return true;
-  return false;
+  const originalCount = room.playerPool.filter(p => !p.isAIGenerated).length;
+  if (originalCount === 0) return false;
+  // currentIndex is the index of the player just sold/unsold.
+  // Auction is complete when that index is the last original player.
+  return room.currentIndex >= originalCount - 1;
 }
 
 function pauseAuction(code) {
   const room = rooms.get(code);
   if (!room) return false;
-  if (room.timerInterval) { clearInterval(room.timerInterval); room.timerInterval = null; }
+  if (room.timerInterval) {
+    clearInterval(room.timerInterval);
+    room.timerInterval = null; // FIX #4: always null the ref
+  }
   room.status = 'paused';
   return true;
 }
@@ -314,16 +316,19 @@ function resumeAuction(code) {
 function endAuction(code) {
   const room = rooms.get(code);
   if (!room) return null;
-  if (room.timerInterval) { clearInterval(room.timerInterval); room.timerInterval = null; }
+  if (room.timerInterval) {
+    clearInterval(room.timerInterval);
+    room.timerInterval = null;
+  }
   room.status = 'ended';
 
-  // Build leaderboard: sort by squad value descending
   const leaderboard = room.participants
     .map(p => ({
       teamId: p.teamId,
       teamName: p.teamName,
       username: p.username,
       primaryColor: p.primaryColor,
+      secondaryColor: p.secondaryColor,
       squadCount: p.squad.length,
       spent: p.spent,
       budget: p.budget,
@@ -338,6 +343,7 @@ function endAuction(code) {
 function getRoomPublicState(code) {
   const room = rooms.get(code);
   if (!room) return null;
+  // Exclude non-serialisable / internal fields
   const { timerInterval, lastBidAt, playerPool, ...rest } = room;
   return {
     ...rest,
